@@ -22,6 +22,7 @@
 #else
 #include <ATen/ScalarOps.h>
 #include <ATen/ops/_cholesky_solve_helper_native.h>
+#include <ATen/ops/_int_mm_native.h>
 #include <ATen/ops/_linalg_check_errors.h>
 #include <ATen/ops/_linalg_eigh.h>
 #include <ATen/ops/_linalg_solve_ex_native.h>
@@ -60,6 +61,7 @@
 
 #include <c10/util/env.h>
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -343,6 +345,53 @@ Tensor& do_metal_mm(const Tensor& self, const Tensor& other, Tensor& output) {
       mtl_setArgs(computeEncoder, self_, other_, output, strides, sizes);
       [computeEncoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
       getMPSProfiler().endProfileKernel(matmulPSO);
+    }
+  });
+  return output;
+}
+
+Tensor& do_metal_int_mm(const Tensor& self, const Tensor& mat2, Tensor& output) {
+  const auto mat1Layout = resolve_matrix(self);
+  const auto mat2Layout = resolve_matrix(mat2);
+#ifdef CAN_BUILD_METAL_4
+  constexpr int64_t max_mpp_index = std::numeric_limits<int32_t>::max();
+  const bool useMpp = has_mpp() && self.scalar_type() == kChar && mat1Layout.stride == 1 && mat2Layout.stride == 1 &&
+      self.size(0) <= max_mpp_index && self.size(1) <= max_mpp_index && mat2.size(1) <= max_mpp_index &&
+      self.stride(0) <= max_mpp_index && self.stride(1) <= max_mpp_index && mat2.stride(0) <= max_mpp_index &&
+      mat2.stride(1) <= max_mpp_index && output.stride(0) <= max_mpp_index && output.stride(1) <= max_mpp_index;
+#else
+  constexpr bool useMpp = false;
+#endif
+  auto stream = getCurrentMPSStream();
+  std::string kernel = "int_mm_" + mps::scalarToMetalTypeString(self);
+  if (useMpp) {
+    kernel = fmt::format("int_mm_mpp_{}{}", mat1Layout.transposed ? 't' : 'n', mat2Layout.transposed ? 't' : 'n');
+  }
+  auto intMMPSO = lib.getPipelineStateForFunc(kernel);
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      getMPSProfiler().beginProfileKernel(intMMPSO, "int_mm", {self, mat2});
+      auto computeEncoder = stream->commandEncoder();
+      [computeEncoder setComputePipelineState:intMMPSO];
+      c10::metal::vec3<uint32_t> sizes = {static_cast<uint32_t>(self.size(0)),
+                                          static_cast<uint32_t>(self.size(1)),
+                                          static_cast<uint32_t>(output.size(1))};
+      std::array<int64_t, 6> strides = {
+          self.stride(0), self.stride(1), mat2.stride(0), mat2.stride(1), output.stride(0), output.stride(1)};
+
+      mtl_setArgs(computeEncoder, self, mat2, output, strides, sizes);
+      if (useMpp) {
+        const MTLSize threadgroupsPerGrid = MTLSizeMake((output.size(1) + 31) / 32, (self.size(0) + 63) / 64, 1);
+        const MTLSize threadsPerThreadgroup = MTLSizeMake(4 * intMMPSO.threadExecutionWidth, 1, 1);
+        [computeEncoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+      } else {
+        constexpr uint32_t TILE_DIM = 16;
+        const MTLSize threadgroupsPerGrid =
+            MTLSizeMake((output.size(1) + TILE_DIM - 1) / TILE_DIM, (self.size(0) + TILE_DIM - 1) / TILE_DIM, 1);
+        const MTLSize threadsPerThreadgroup = MTLSizeMake(TILE_DIM, TILE_DIM, 1);
+        [computeEncoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+      }
+      getMPSProfiler().endProfileKernel(intMMPSO);
     }
   });
   return output;
@@ -999,6 +1048,42 @@ static void linalg_inv_ex_out_mps_impl(const Tensor& A, bool check_errors, const
   Tensor tmp = empty_like(A, MemoryFormat::Contiguous);
   linalg_solve_out_mps_impl(A, identity, true, check_errors, tmp, LU, pivots, info);
   result.copy_(tmp);
+}
+
+static Tensor& int_mm_out_mps_impl(const Tensor& self, const Tensor& mat2, Tensor& result) {
+  static constexpr std::string_view func_name = "int_mm_out_mps";
+  TORCH_CHECK(self.dim() == 2, func_name, ": Expected self to be of dimension 2 but got ", self.dim());
+  TORCH_CHECK(mat2.dim() == 2, func_name, ": Expected mat2 to be of dimension 2 but got ", mat2.dim());
+  TORCH_CHECK(self.size(1) == mat2.size(0),
+              func_name,
+              ": self.size(1) needs to match mat2.size(0) but got ",
+              self.size(1),
+              " and ",
+              mat2.size(0));
+  TORCH_CHECK(self.dtype() == at::kChar || self.dtype() == at::kByte,
+              func_name,
+              ": Expected self dtype to be int8 or uint8 but got ",
+              self.dtype());
+  TORCH_CHECK(mat2.dtype() == at::kChar, func_name, ": Expected mat2 dtype to be of type int8 but got ", mat2.dtype());
+  TORCH_CHECK(
+      result.dtype() == at::kInt, func_name, ": Expected result dtype to be of type kInt but got ", result.dtype());
+  TORCH_CHECK(result.dim() == 2, func_name, ": Expected result to be of dimension 2 but got ", result.dim());
+  TORCH_CHECK(result.sizes() == IntArrayRef({self.size(0), mat2.size(1)}),
+              func_name,
+              ": Expected result shape to be (",
+              self.size(0),
+              ", ",
+              mat2.size(1),
+              ") but got ",
+              result.sizes());
+  TORCH_CHECK(result.is_contiguous(), func_name, ": Expected result to be contiguous.");
+
+  TensorArg args[]{{result, "out", 0}, {self, "self", 1}, {mat2, "mat2", 2}};
+  checkAllSameGPU("_int_mm", args);
+  if (result.numel() == 0 || self.size(1) == 0) {
+    return result.zero_();
+  }
+  return do_metal_int_mm(self, mat2, result);
 }
 
 static Tensor& mm_out_mps_impl(const Tensor& self, const Tensor& other, Tensor& output) {
@@ -2238,6 +2323,15 @@ static void lstsq_kernel_mps(const Tensor& a,
 }
 
 } // namespace mps
+
+Tensor& _int_mm_out_mps(const Tensor& self, const Tensor& mat2, Tensor& result) {
+  return mps::int_mm_out_mps_impl(self, mat2, result);
+}
+
+Tensor _int_mm_mps(const Tensor& self, const Tensor& mat2) {
+  Tensor result = at::empty({self.size(0), mat2.size(1)}, self.options().dtype(at::kInt));
+  return mps::int_mm_out_mps_impl(self, mat2, result);
+}
 
 Tensor addr_mps(const Tensor& self, const Tensor& vec1, const Tensor& vec2, const Scalar& beta, const Scalar& alpha) {
   Tensor result = at::empty({0}, self.options());

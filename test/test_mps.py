@@ -12374,6 +12374,65 @@ class TestLinalgMPS(TestCaseMPS):
             mean_err = ((res - ref).abs() / ref).mean()
             self.assertLess(mean_err, 0.05)
 
+    @parametrize("self_dtype", [torch.int8, torch.uint8])
+    @parametrize("shape", [(1, 0, 8), (1, 8, 8), (17, 16, 32), (33, 31, 19)])
+    @parametrize("transpose_a", [False, True])
+    @parametrize("transpose_b", [False, True])
+    def test__int_mm_mps(self, self_dtype, shape, transpose_a, transpose_b):
+        m, k, n = shape
+
+        def make_input(rows, cols, dtype, transpose):
+            source_shape = (cols, rows) if transpose else (rows, cols)
+            low, high = (0, 256) if dtype is torch.uint8 else (-128, 128)
+            result = torch.randint(low, high, source_shape, dtype=dtype)
+            return result.t() if transpose else result
+
+        a_cpu = make_input(m, k, self_dtype, transpose_a)
+        b_cpu = make_input(k, n, torch.int8, transpose_b)
+        expected = torch._int_mm(a_cpu, b_cpu)
+        a_mps = a_cpu.to("mps")
+        b_mps = b_cpu.to("mps")
+
+        actual = torch._int_mm(a_mps, b_mps)
+        self.assertEqual(actual.dtype, torch.int32)
+        self.assertEqual(actual.device.type, "mps")
+        self.assertEqual(actual.cpu(), expected)
+
+        out = torch.empty((m, n), dtype=torch.int32, device="mps")
+        returned = torch._int_mm(a_mps, b_mps, out=out)
+        self.assertIs(returned, out)
+        self.assertEqual(out.cpu(), expected)
+
+    @parametrize("self_dtype", [torch.int8, torch.uint8])
+    def test__int_mm_mps_strided(self, self_dtype):
+        low, high = (0, 256) if self_dtype is torch.uint8 else (-128, 128)
+        a_cpu = torch.randint(low, high, (7, 22), dtype=self_dtype)[:, 1::2]
+        b_cpu = torch.randint(-128, 128, (11, 26), dtype=torch.int8)[:, 1::2]
+        expected = torch._int_mm(a_cpu, b_cpu)
+
+        actual = torch._int_mm(a_cpu.to("mps"), b_cpu.to("mps"))
+        self.assertEqual(actual.cpu(), expected)
+
+    def test__int_mm_mps_int32_overflow(self):
+        # 200000 * 127 * 127 exceeds INT32_MAX. The MPS kernel must match
+        # CPU's int32 wraparound rather than saturating the accumulator.
+        a_cpu = torch.full((1, 200000), 127, dtype=torch.int8)
+        b_cpu = torch.full((200000, 1), 127, dtype=torch.int8)
+        expected = torch._int_mm(a_cpu, b_cpu)
+
+        actual = torch._int_mm(a_cpu.to("mps"), b_cpu.to("mps"))
+        self.assertEqual(actual.cpu(), expected)
+
+    def test__int_mm_mps_errors(self):
+        a = torch.ones((4, 8), dtype=torch.int8, device="mps")
+        b = torch.ones((8, 5), dtype=torch.int8, device="mps")
+        with self.assertRaisesRegex(RuntimeError, "Expected result dtype"):
+            torch._int_mm(
+                a,
+                b,
+                out=torch.empty((4, 5), dtype=torch.float32, device="mps"),
+            )
+
     def test_loradown_regression_original_case(self):
         a = torch.rand(2, 1025, device='mps', dtype=torch.half)
         b = torch.rand(2, 1041, device='mps', dtype=torch.half)[:, :1025].t()
