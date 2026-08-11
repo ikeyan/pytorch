@@ -18,6 +18,7 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/_cholesky_solve_helper_native.h>
+#include <ATen/ops/_int_mm_native.h>
 #include <ATen/ops/_linalg_solve_ex_native.h>
 #include <ATen/ops/addbmm_native.h>
 #include <ATen/ops/addmm_native.h>
@@ -47,6 +48,7 @@
 
 #include <c10/util/env.h>
 #include <algorithm>
+#include <string>
 
 namespace at::native {
 namespace mps {
@@ -106,6 +108,32 @@ Tensor& do_metal_mm(const Tensor& self, const Tensor& other, Tensor& output) {
       mtl_setArgs(computeEncoder, self_, other_, output, strides, sizes);
       [computeEncoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
       getMPSProfiler().endProfileKernel(matmulPSO);
+    }
+  });
+  return output;
+}
+
+Tensor& do_metal_int_mm(const Tensor& self, const Tensor& mat2, Tensor& output) {
+  auto stream = getCurrentMPSStream();
+  auto intMMPSO = lib.getPipelineStateForFunc("int_mm_" + mps::scalarToMetalTypeString(self));
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      getMPSProfiler().beginProfileKernel(intMMPSO, "int_mm", {self, mat2});
+      auto computeEncoder = stream->commandEncoder();
+      [computeEncoder setComputePipelineState:intMMPSO];
+      std::array<uint32_t, 3> sizes = {static_cast<uint32_t>(self.size(0)),
+                                       static_cast<uint32_t>(self.size(1)),
+                                       static_cast<uint32_t>(output.size(1))};
+      std::array<int64_t, 6> strides = {
+          self.stride(0), self.stride(1), mat2.stride(0), mat2.stride(1), output.stride(0), output.stride(1)};
+      constexpr uint32_t TILE_DIM = 16;
+      const MTLSize threadgroupsPerGrid =
+          MTLSizeMake((output.size(1) + TILE_DIM - 1) / TILE_DIM, (self.size(0) + TILE_DIM - 1) / TILE_DIM, 1);
+      const MTLSize threadsPerThreadgroup = MTLSizeMake(TILE_DIM, TILE_DIM, 1);
+
+      mtl_setArgs(computeEncoder, self, mat2, output, strides, sizes);
+      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+      getMPSProfiler().endProfileKernel(intMMPSO);
     }
   });
   return output;
@@ -670,6 +698,41 @@ static void linalg_inv_ex_out_mps_impl(const Tensor& A, bool check_errors, const
   Tensor tmp = empty_like(A, MemoryFormat::Contiguous);
   linalg_solve_out_mps_impl(A, identity, true, check_errors, tmp, LU, pivots, info);
   result.copy_(tmp);
+}
+
+static Tensor& int_mm_out_mps_impl(const Tensor& self, const Tensor& mat2, Tensor& result) {
+  static constexpr std::string_view func_name = "int_mm_out_mps";
+  TORCH_CHECK(self.dim() == 2, func_name, ": Expected self to be of dimension 2 but got ", self.dim());
+  TORCH_CHECK(mat2.dim() == 2, func_name, ": Expected mat2 to be of dimension 2 but got ", mat2.dim());
+  TORCH_CHECK(self.size(1) == mat2.size(0),
+              func_name,
+              ": self.size(1) needs to match mat2.size(0) but got ",
+              self.size(1),
+              " and ",
+              mat2.size(0));
+  TORCH_CHECK(self.dtype() == at::kChar || self.dtype() == at::kByte,
+              func_name,
+              ": Expected self dtype to be int8 or uint8 but got ",
+              self.dtype());
+  TORCH_CHECK(mat2.dtype() == at::kChar, func_name, ": Expected mat2 dtype to be of type int8 but got ", mat2.dtype());
+  TORCH_CHECK(result.dtype() == at::kInt, func_name, ": Expected result dtype to be of type kInt but got ", result.dtype());
+  TORCH_CHECK(result.dim() == 2, func_name, ": Expected result to be of dimension 2 but got ", result.dim());
+  TORCH_CHECK(result.sizes() == IntArrayRef({self.size(0), mat2.size(1)}),
+              func_name,
+              ": Expected result shape to be (",
+              self.size(0),
+              ", ",
+              mat2.size(1),
+              ") but got ",
+              result.sizes());
+  TORCH_CHECK(result.is_contiguous(), func_name, ": Expected result to be contiguous.");
+
+  TensorArg args[]{{result, "out", 0}, {self, "self", 1}, {mat2, "mat2", 2}};
+  checkAllSameGPU("_int_mm", args);
+  if (result.numel() == 0 || self.size(1) == 0) {
+    return result.zero_();
+  }
+  return do_metal_int_mm(self, mat2, result);
 }
 
 static Tensor& mm_out_mps_impl(const Tensor& self, const Tensor& other, Tensor& output) {
@@ -1590,6 +1653,15 @@ static void linalg_qr_out_impl_mps(const Tensor& A, const Tensor& Q, const Tenso
 
 } // namespace mps
 
+Tensor& _int_mm_out_mps(const Tensor& self, const Tensor& mat2, Tensor& result) {
+  return mps::int_mm_out_mps_impl(self, mat2, result);
+}
+
+Tensor _int_mm_mps(const Tensor& self, const Tensor& mat2) {
+  Tensor result = at::empty({self.size(0), mat2.size(1)}, self.options().dtype(at::kInt));
+  return mps::int_mm_out_mps_impl(self, mat2, result);
+}
+
 Tensor addr_mps(const Tensor& self, const Tensor& vec1, const Tensor& vec2, const Scalar& beta, const Scalar& alpha) {
   Tensor result = at::empty({0}, self.options());
   addr_out_mps(self, vec1, vec2, beta, alpha, result);
@@ -1844,3 +1916,4 @@ REGISTER_DISPATCH(orgqr_stub, mps::orgqr_stub_impl);
 REGISTER_DISPATCH(cholesky_inverse_stub, mps::cholesky_inverse_kernel_impl_mps);
 
 } // namespace at::native
+#include <string_view>

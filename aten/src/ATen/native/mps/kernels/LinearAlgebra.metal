@@ -119,6 +119,67 @@ kernel void matmul(
   }
 }
 
+template <typename input_t>
+inline int int_mm_inner(
+    constant input_t* mat1Data,
+    constant char* mat2Data,
+    constant array<ulong2, 3>& strides,
+    constant uint3& sizes,
+    threadgroup int A_tile[TILE_DIM][TILE_DIM],
+    threadgroup int B_tile[TILE_DIM][TILE_DIM],
+    uint2 tid,
+    uint2 thread_id) {
+  int sum = 0;
+
+  const uint numTiles = (sizes.y + TILE_DIM - 1) / TILE_DIM;
+  for (uint t = 0; t < numTiles; t++) {
+    const uint tiledCol = t * TILE_DIM + tid.x;
+    if (thread_id.y < sizes.x && tiledCol < sizes.y) {
+      A_tile[tid.y][tid.x] = static_cast<int>(
+          mat1Data[thread_id.y * strides[0].x + tiledCol * strides[0].y]);
+    } else {
+      A_tile[tid.y][tid.x] = 0;
+    }
+
+    const uint tiledRow = t * TILE_DIM + tid.y;
+    if (tiledRow < sizes.y && thread_id.x < sizes.z) {
+      B_tile[tid.y][tid.x] = static_cast<int>(
+          mat2Data[tiledRow * strides[1].x + thread_id.x * strides[1].y]);
+    } else {
+      B_tile[tid.y][tid.x] = 0;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k = 0; k < TILE_DIM; k++) {
+      sum += A_tile[tid.y][k] * B_tile[k][tid.x];
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  return sum;
+}
+
+template <typename input_t>
+kernel void int_mm(
+    constant input_t* mat1Data [[buffer(0)]],
+    constant char* mat2Data [[buffer(1)]],
+    device int* outputData [[buffer(2)]],
+    constant array<ulong2, 3>& strides [[buffer(3)]],
+    constant uint3& sizes [[buffer(4)]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 thread_id [[thread_position_in_grid]]) {
+  threadgroup int A_tile[TILE_DIM][TILE_DIM];
+  threadgroup int B_tile[TILE_DIM][TILE_DIM];
+
+  const int sum = int_mm_inner<input_t>(
+      mat1Data, mat2Data, strides, sizes, A_tile, B_tile, tid, thread_id);
+  if (thread_id.y < sizes.x && thread_id.x < sizes.z) {
+    outputData[thread_id.y * strides[2].x + thread_id.x * strides[2].y] = sum;
+  }
+}
+
 template <typename T>
 kernel void addmm(
     constant T* mat1Data [[buffer(0)]],
@@ -1176,6 +1237,19 @@ INSTANTIATE_MM_OPS(int);
 INSTANTIATE_MM_OPS(short);
 INSTANTIATE_MM_OPS(char);
 INSTANTIATE_MM_OPS(uchar);
+
+#define INSTANTIATE_INT_MM(DTYPE)                                     \
+  template [[host_name("int_mm_" #DTYPE)]] kernel void int_mm<DTYPE>( \
+      constant DTYPE * mat1Data [[buffer(0)]],                        \
+      constant char* mat2Data [[buffer(1)]],                          \
+      device int* outputData [[buffer(2)]],                           \
+      constant array<ulong2, 3>& strides [[buffer(3)]],               \
+      constant uint3& sizes [[buffer(4)]],                            \
+      uint2 tid [[thread_position_in_threadgroup]],                   \
+      uint2 thread_id [[thread_position_in_grid]])
+
+INSTANTIATE_INT_MM(char);
+INSTANTIATE_INT_MM(uchar);
 
 #define REGISTER_ORGQR(T)                            \
   template [[host_name("orgqr_" #T)]]                \
