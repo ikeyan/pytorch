@@ -6,6 +6,11 @@
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
+#if __METAL_VERSION__ >= 400 && \
+    __has_include(<MetalPerformancePrimitives/MetalPerformancePrimitives.h>)
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
+
 using namespace metal;
 constant uint TILE_DIM = 16;
 
@@ -179,6 +184,71 @@ kernel void int_mm(
     outputData[thread_id.y * strides[2].x + thread_id.x * strides[2].y] = sum;
   }
 }
+
+#if __METAL_VERSION__ >= 400 && \
+    __has_include(<MetalPerformancePrimitives/MetalPerformancePrimitives.h>)
+template <bool transpose_a, bool transpose_b>
+kernel void int_mm_mpp(
+    device int8_t* mat1Data [[buffer(0)]],
+    device int8_t* mat2Data [[buffer(1)]],
+    device int32_t* outputData [[buffer(2)]],
+    constant array<ulong2, 3>& strides [[buffer(3)]],
+    constant uint3& sizes [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+  constexpr uint BM = 64;
+  constexpr uint BN = 32;
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      BM,
+      BN,
+      static_cast<int>(dynamic_extent),
+      transpose_a,
+      transpose_b,
+      false,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+  mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> mat1(
+      mat1Data,
+      dextents<int32_t, 2>(
+          transpose_a ? sizes.x : sizes.y, transpose_a ? sizes.y : sizes.x),
+      array<int32_t, 2>{
+          static_cast<int32_t>(transpose_a ? strides[0].x : strides[0].y),
+          static_cast<int32_t>(transpose_a ? strides[0].y : strides[0].x)});
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> mat2(
+      mat2Data,
+      dextents<int32_t, 2>(
+          transpose_b ? sizes.y : sizes.z, transpose_b ? sizes.z : sizes.y),
+      array<int32_t, 2>{
+          static_cast<int32_t>(transpose_b ? strides[1].x : strides[1].y),
+          static_cast<int32_t>(transpose_b ? strides[1].y : strides[1].x)});
+  tensor<device int32_t, dextents<int32_t, 2>, tensor_inline> output(
+      outputData,
+      dextents<int32_t, 2>(sizes.z, sizes.x),
+      array<int32_t, 2>{
+          static_cast<int32_t>(strides[2].y),
+          static_cast<int32_t>(strides[2].x)});
+
+  auto mat1Tile = mat1.slice(transpose_a ? tgid.y * BM : 0, transpose_a ? 0 : tgid.y * BM);
+  auto mat2Tile = mat2.slice(transpose_b ? 0 : tgid.x * BN, transpose_b ? tgid.x * BN : 0);
+  auto outputTile = output.slice(tgid.x * BN, tgid.y * BM);
+  op.run(mat1Tile, mat2Tile, outputTile);
+}
+
+#define INSTANTIATE_INT_MM_MPP(SUFFIX, TRANSPOSE_A, TRANSPOSE_B) \
+  template [[host_name("int_mm_mpp_" #SUFFIX)]] kernel void \
+  int_mm_mpp<TRANSPOSE_A, TRANSPOSE_B>( \
+      device int8_t* mat1Data [[buffer(0)]], \
+      device int8_t* mat2Data [[buffer(1)]], \
+      device int32_t* outputData [[buffer(2)]], \
+      constant array<ulong2, 3>& strides [[buffer(3)]], \
+      constant uint3& sizes [[buffer(4)]], \
+      uint2 tgid [[threadgroup_position_in_grid]])
+
+INSTANTIATE_INT_MM_MPP(nn, false, false);
+INSTANTIATE_INT_MM_MPP(nt, false, true);
+INSTANTIATE_INT_MM_MPP(tn, true, false);
+INSTANTIATE_INT_MM_MPP(tt, true, true);
+#endif
 
 template <typename T>
 kernel void addmm(

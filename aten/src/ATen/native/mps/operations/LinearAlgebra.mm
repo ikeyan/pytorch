@@ -1,7 +1,9 @@
 //  Copyright © 2022 Apple Inc.
 
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <limits>
 #include <ATen/mps/MPSProfiler.h>
+#include <ATen/mps/MPSDevice.h>
 #include <ATen/native/BatchLinearAlgebra.h>
 #include <ATen/native/LinearAlgebra.h>
 #include <ATen/native/LinearAlgebraUtils.h>
@@ -115,7 +117,22 @@ Tensor& do_metal_mm(const Tensor& self, const Tensor& other, Tensor& output) {
 
 Tensor& do_metal_int_mm(const Tensor& self, const Tensor& mat2, Tensor& output) {
   auto stream = getCurrentMPSStream();
-  auto intMMPSO = lib.getPipelineStateForFunc("int_mm_" + mps::scalarToMetalTypeString(self));
+  const bool mat1_transposed = self.stride(0) == 1 && self.stride(1) >= self.size(0);
+  const bool mat2_transposed = mat2.stride(0) == 1 && mat2.stride(1) >= mat2.size(0);
+#ifdef CAN_BUILD_METAL_4
+  constexpr int64_t max_mpp_index = std::numeric_limits<int32_t>::max();
+  const bool use_mpp = at::mps::has_mpp() && self.scalar_type() == at::kChar &&
+      self.size(0) <= max_mpp_index && self.size(1) <= max_mpp_index && mat2.size(1) <= max_mpp_index &&
+      self.stride(0) <= max_mpp_index && self.stride(1) <= max_mpp_index && mat2.stride(0) <= max_mpp_index &&
+      mat2.stride(1) <= max_mpp_index && output.stride(0) <= max_mpp_index && output.stride(1) <= max_mpp_index;
+#else
+  constexpr bool use_mpp = false;
+#endif
+  std::string kernel = "int_mm_" + mps::scalarToMetalTypeString(self);
+  if (use_mpp) {
+    kernel = fmt::format("int_mm_mpp_{}{}", mat1_transposed ? 't' : 'n', mat2_transposed ? 't' : 'n');
+  }
+  auto intMMPSO = lib.getPipelineStateForFunc(kernel);
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       getMPSProfiler().beginProfileKernel(intMMPSO, "int_mm", {self, mat2});
@@ -126,13 +143,18 @@ Tensor& do_metal_int_mm(const Tensor& self, const Tensor& mat2, Tensor& output) 
                                        static_cast<uint32_t>(output.size(1))};
       std::array<int64_t, 6> strides = {
           self.stride(0), self.stride(1), mat2.stride(0), mat2.stride(1), output.stride(0), output.stride(1)};
-      constexpr uint32_t TILE_DIM = 16;
-      const MTLSize threadgroupsPerGrid =
-          MTLSizeMake((output.size(1) + TILE_DIM - 1) / TILE_DIM, (self.size(0) + TILE_DIM - 1) / TILE_DIM, 1);
-      const MTLSize threadsPerThreadgroup = MTLSizeMake(TILE_DIM, TILE_DIM, 1);
-
       mtl_setArgs(computeEncoder, self, mat2, output, strides, sizes);
-      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+      if (use_mpp) {
+        const MTLSize threadgroupsPerGrid = MTLSizeMake((output.size(1) + 31) / 32, (self.size(0) + 63) / 64, 1);
+        const MTLSize threadsPerThreadgroup = MTLSizeMake(4 * intMMPSO.threadExecutionWidth, 1, 1);
+        [computeEncoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+      } else {
+        constexpr uint32_t TILE_DIM = 16;
+        const MTLSize threadgroupsPerGrid =
+            MTLSizeMake((output.size(1) + TILE_DIM - 1) / TILE_DIM, (self.size(0) + TILE_DIM - 1) / TILE_DIM, 1);
+        const MTLSize threadsPerThreadgroup = MTLSizeMake(TILE_DIM, TILE_DIM, 1);
+        [computeEncoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+      }
       getMPSProfiler().endProfileKernel(intMMPSO);
     }
   });
